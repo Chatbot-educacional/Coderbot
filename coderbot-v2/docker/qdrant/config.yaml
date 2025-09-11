@@ -1,0 +1,44 @@
+# Configuração Qdrant otimizada para sistema educacional RAG
+log_level: 'INFO'
+log_format: 'json'
+
+service:
+  http_port: 6333
+  grpc_port: 6334
+  max_request_size_mb: 32
+  max_workers: 4
+  enable_cors: true
+  enable_tls: false
+
+storage:
+  storage_path: '/qdrant/storage'
+  snapshots_path: '/qdrant/snapshots'
+  temp_path: '/qdrant/temp'
+  optimizers:
+    indexing_threshold_kb: 10000
+    memmap_threshold_kb: 20000
+    max_segment_size_kb: 100000
+    deleted_threshold: 0.2
+    vacuum_min_vector_number: 1000
+    default_segment_number: 2
+    flush_interval_sec: 30
+
+# Configuração para alta disponibilidade em produção
+cluster:
+  enabled: false
+  p2p:
+    port: 6335
+  consensus:
+    tick_period_ms: 100
+
+# Configurações de telemetria (desabilitadas para desenvolvimento)
+telemetry_disabled: true
+
+# Configurações específicas para RAG educacional
+collection:
+  default_vector_params:
+    size: 1536  # Para embeddings OpenAI text-embedding-3-large
+    distance: 'Cosine'
+    on_disk: false  # Manter em memória para melhor performance
+  default_payload_schema:
+    type: 'keyword'  # Schema flexível para metadados educacionais

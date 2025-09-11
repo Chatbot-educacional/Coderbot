@@ -754,6 +754,7 @@ const Whiteboard: React.FC = () => {
               <ChatInterface
                 whiteboardContext={structuredWhiteboardContext || scene || undefined}
                 methodology="worked_examples"
+                userId={user?.id}
               />
             </SheetContent>
           </Sheet>

@@ -1,0 +1,24 @@
+# Qdrant Vector Database Dockerfile
+FROM qdrant/qdrant:latest
+
+# Copiar configuração customizada se existir
+COPY docker/qdrant/config.yaml /qdrant/config/config.yaml
+
+# Criar diretórios necessários
+RUN mkdir -p /qdrant/storage /qdrant/snapshots
+
+# Ajustar permissões
+RUN chmod -R 755 /qdrant/storage /qdrant/snapshots
+
+# Expor portas
+EXPOSE 6333 6334
+
+# Volume para dados persistentes
+VOLUME ["/qdrant/storage", "/qdrant/snapshots"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:6333/healthz || exit 1
+
+# Comando para iniciar
+CMD ["./qdrant"]

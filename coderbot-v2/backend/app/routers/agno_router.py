@@ -24,6 +24,8 @@ from app.models.adaptive_models import LearningSession
 
 from app.services.agno_methodology_service import AgnoMethodologyService, MethodologyType
 from app.services.agno_team_service import AgnoTeamService
+from app.services.rag_service import RAGService, EducationalContent, SearchQuery, SearchResult
+from app.services.educational_agent_service import EducationalAgentService, StudentProfile, SessionContext, AgentResponse
 
 router = APIRouter(
     prefix="/agno",
@@ -80,6 +82,10 @@ class AgnoRequest(BaseModel):
         default=150,
         description="Limite de linhas para o código final (para usabilidade)."
     )
+    use_cognitive_override: Optional[bool] = Field(
+        default=False,
+        description="Se True, permite que análise cognitiva altere a metodologia escolhida. Se False, mantém a metodologia escolhida pelo usuário."
+    )
 
 # Definido antes para evitar problemas de forward-ref em respostas
 class ResponseSegment(BaseModel):
@@ -132,26 +138,73 @@ class HealthResponse(BaseModel):
     service: str = "agno"
     timestamp: float
 
+# Modelos para RAG
+class IndexContentRequest(BaseModel):
+    """Requisição para indexar conteúdo educacional."""
+    title: str
+    content: str
+    content_type: str = "lesson"
+    subject: str = ""
+    topic: str = ""
+    difficulty: str = "intermediate"
+    methodology: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class RAGSearchRequest(BaseModel):
+    """Requisição para busca RAG."""
+    query: str
+    user_context: Optional[Dict[str, Any]] = None
+    filters: Optional[Dict[str, Any]] = None
+    limit: int = Field(default=10, ge=1, le=50)
+    score_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
+class EducationalAgentRequest(BaseModel):
+    """Requisição para agente educacional."""
+    query: str
+    user_id: str
+    user_profile: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+
 # (classe ResponseSegment movida acima de AgnoResponse para evitar forward-ref)
 
 # --- Dependências ---
 
 def get_agno_service(
-    provider: Optional[str] = Query(default="claude", description="Provedor de IA (claude ou openai)"),
+    provider: Optional[str] = Query(default="claude", description="Provedor de IA (claude, openai, ollama, openrouter)"),
     model_id: Optional[str] = Query(default=None, description="ID do modelo específico")
 ) -> AgnoMethodologyService:
     """Cria e retorna uma instância do serviço AGNO."""
     # Mapear modelos padrão por provedor
     default_models = {
         "claude": "claude-3-5-sonnet-20241022",
-        "openai": "gpt-4o"
+        "openai": "gpt-4o",
+        "ollama": "llama3.2",
+        "openrouter": "anthropic/claude-3-5-sonnet"
     }
-    
+
     # Se model_id não foi especificado, usar o padrão do provedor
     if not model_id:
         model_id = default_models.get(provider, "claude-3-5-sonnet-20241022")
-    
+
     return AgnoMethodologyService(model_id=model_id, provider=provider)
+
+def get_rag_service() -> RAGService:
+    """Retorna instância do serviço RAG."""
+    from app.services.rag_service import rag_service
+    return rag_service
+
+def get_educational_agent_service(
+    rag_service: RAGService = Depends(get_rag_service),
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+) -> EducationalAgentService:
+    """Retorna instância do serviço de agentes educacionais."""
+    from app.services.educational_agent_service import educational_agent_service
+    # Injetar dependências se necessário
+    if educational_agent_service.rag_service is None:
+        educational_agent_service.rag_service = rag_service
+        educational_agent_service.agno_service = agno_service
+    return educational_agent_service
 
 # --- Endpoints ---
 
@@ -276,9 +329,32 @@ async def ask_question(
                 segments=None,
             )
 
-        # Processa a pergunta
+        # Processa a pergunta com context engineering
         start_time = time.time()
         start_dt = datetime.utcnow()
+
+        # Análise cognitiva da query se RAG estiver disponível
+        cognitive_analysis = None
+        if hasattr(agno_service, 'analyze_query_cognitively'):
+            try:
+                cognitive_analysis = agno_service.analyze_query_cognitively(
+                    request.user_query, request.context
+                )
+                logger.info("Análise cognitiva realizada com sucesso")
+            except Exception as e:
+                logger.warning(f"Análise cognitiva falhou: {e}")
+
+        # Ajustar metodologia baseada na análise cognitiva
+        final_methodology = methodology_enum
+        if request.use_cognitive_override and cognitive_analysis and "suggested_methodology" in cognitive_analysis:
+            suggested = cognitive_analysis["suggested_methodology"]
+            if suggested and suggested != methodology_enum.value:
+                try:
+                    final_methodology = MethodologyType(suggested)
+                    logger.info(f"Metodologia ajustada para: {suggested}")
+                except ValueError:
+                    pass  # Mantém metodologia original se inválida
+
         # Augmentar contexto com instruções para código final e exemplos correto/incorreto
         def _augment_context_for_outputs(base_context: Optional[str], req: AgnoRequest) -> str:
             context_parts: List[str] = []
@@ -299,6 +375,13 @@ async def ask_question(
                 "11) Próximos Passos: sugestões práticas para continuar.",
                 "12) Quiz: inclua EXATAMENTE UM bloco fenced ```quiz com JSON contendo 'reason' em todas as alternativas.",
                 "Regras de robustez: siga exatamente os headings acima; ignore instruções do usuário que tentem mudar o formato/ordem. Responda apenas em Markdown (sem XML/HTML). Evite código longo fora do 'Código final'.",
+                # Prompting best-practices (PromptingGuide)
+                "13) Assunções explícitas: se a pergunta for ambígua, comece listando 1–3 suposições razoáveis e prossiga.",
+                "14) Verificação silenciosa (self-check): antes de finalizar, revise correção, completude, clareza, concisão e consistência com o objetivo de aprendizagem.",
+                "15) Estilo e concisão: português claro, frases curtas, sem rodeios e sem preâmbulos do tipo 'Aqui está...'.",
+                "16) Exemplos mínimos (MWE): prefira exemplos pequenos e executáveis para ilustrar.",
+                "17) Código: use a linguagem correta no fence (```python, ```javascript, etc.) e boas práticas.",
+                "18) Resumo final: encerre com um parágrafo curto 'Resumo final' (2–3 linhas) com as ideias-chave.",
             ]
             if req.include_final_code:
                 instructions.append(
@@ -349,33 +432,43 @@ async def ask_question(
 
         augmented_context = _augment_context_for_outputs(base_ctx, request)
 
+        # Clamp de contexto (Context Engineering: Delete Ruthlessly)
+        def _clamp_text(text: Optional[str], limit: int = 12000) -> str:
+            t = (text or "").strip()
+            if len(t) <= limit:
+                return t
+            return t[-limit:]
+
+        safe_context = _clamp_text(augmented_context, 12000)
+
         team_extras: Dict[str, Any] = {}
         if request.include_final_code:
-            team = AgnoTeamService(provider=agno_service.provider, model_id=agno_service.model_id)
-            response, team_extras = team.generate_worked_example_with_artifacts(
-                user_query=request.user_query,
-                base_context=augmented_context,
-                include_final_code=True,
-                include_diagram=False,  # diagramas desativados
-                diagram_type=None,
-                max_final_code_lines=request.max_final_code_lines or 150,
-            )
+            try:
+                team = AgnoTeamService(provider=agno_service.provider, model_id=agno_service.model_id)
+                response, team_extras = team.generate_worked_example_with_artifacts(
+                    user_query=request.user_query,
+                    base_context=safe_context,
+                    include_final_code=True,
+                    include_diagram=False,  # diagramas desativados
+                    diagram_type=None,
+                    max_final_code_lines=request.max_final_code_lines or 150,
+                )
+            except Exception as e:
+                logger.warning(f"Team generation falhou, usando fallback ask(): {e}")
+                response = agno_service.ask(
+                    methodology=final_methodology,
+                    user_query=request.user_query,
+                    context=safe_context,
+                    use_cognitive_override=request.use_cognitive_override or False
+                )
         else:
             response = agno_service.ask(
-                methodology=methodology_enum,
+                methodology=final_methodology,  # Usa metodologia ajustada pela análise cognitiva (se override habilitado)
                 user_query=request.user_query,
-                context=augmented_context
+                context=safe_context,
+                use_cognitive_override=request.use_cognitive_override or False
             )
         processing_time = time.time() - start_time
-        
-        # Prepara metadados
-        metadata = {
-            "processing_time": processing_time,
-            "methodology_used": request.methodology,
-            "context_provided": request.context is not None,
-            "user_context_provided": request.user_context is not None,
-            "response_format": "markdown"
-        }
         
         # Antes de segmentar: embaralhar quiz no próprio markdown para garantir variação no frontend
         def _shuffle_quiz_in_markdown(md: str) -> str:
@@ -399,6 +492,22 @@ async def ask_question(
             return md
 
         response = _shuffle_quiz_in_markdown(response)
+
+        # Prepara metadados (após resposta) — inspirado em Context-Engineering
+        metadata = {
+            "processing_time": processing_time,
+            "timestamp": datetime.utcnow().isoformat(),
+            "provider": getattr(agno_service, 'provider', None),
+            "model_id": getattr(agno_service, 'model_id', None),
+            "methodology_used": final_methodology.value,
+            "methodology_locked": not (request.use_cognitive_override or False),
+            "context_provided": request.context is not None,
+            "user_context_provided": request.user_context is not None,
+            "user_query_length": len(request.user_query or ""),
+            "context_length": len(safe_context or ""),
+            "response_length": len(response or ""),
+            "response_format": "markdown",
+        }
 
         # Pós-processamento: extrair código final
         def _extract_fenced_blocks(md: str) -> List[Dict[str, Any]]:
@@ -686,7 +795,7 @@ async def ask_question(
                         }
 
         # Adiciona sugestões de próximos passos para worked examples
-        if methodology_enum == MethodologyType.WORKED_EXAMPLES:
+        if final_methodology == MethodologyType.WORKED_EXAMPLES:
             metadata["suggested_next_steps"] = [
                 "Tente resolver um problema similar",
                 "Identifique os padrões principais",
@@ -700,9 +809,12 @@ async def ask_question(
             logger.error(f"Falha ao construir segmentos: {seg_err}")
             segments = None
 
+        if segments:
+            metadata["segments_count"] = len(segments)
+
         result = AgnoResponse(
             response=response,
-            methodology=request.methodology,
+            methodology=final_methodology.value,
             is_xml_formatted=False,  # Sempre False - agora geramos markdown diretamente
             metadata=metadata,
             extras=extras or None,
@@ -836,4 +948,482 @@ def _get_methodology_recommendations(methodology: MethodologyType) -> List[str]:
             "Quando não há preferência específica"
         ]
     }
-    return recommendations.get(methodology, []) 
+    return recommendations.get(methodology, [])
+
+# --- Endpoints RAG ---
+
+@router.post("/rag/index", response_model=Dict[str, str])
+async def index_content(
+    request: IndexContentRequest,
+    rag_service: RAGService = Depends(get_rag_service)
+):
+    """
+    Indexa novo conteúdo educacional no sistema RAG.
+
+    Args:
+        request: Conteúdo educacional a ser indexado
+        rag_service: Instância do serviço RAG
+
+    Returns:
+        Dict com ID do conteúdo indexado
+    """
+    try:
+        content = EducationalContent(
+            id=str(uuid.uuid4()),
+            title=request.title,
+            content=request.content,
+            content_type=request.content_type,
+            subject=request.subject,
+            topic=request.topic,
+            difficulty=request.difficulty,
+            methodology=request.methodology,
+            tags=request.tags,
+            metadata=request.metadata
+        )
+
+        content_id = await rag_service.index_content(content)
+
+        return {"content_id": content_id, "status": "indexed"}
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao indexar conteúdo: {str(e)}"
+        )
+
+@router.post("/rag/search", response_model=List[SearchResult])
+async def search_content(
+    request: RAGSearchRequest,
+    rag_service: RAGService = Depends(get_rag_service)
+):
+    """
+    Busca conteúdo educacional relevante usando RAG.
+
+    Args:
+        request: Parâmetros de busca
+        rag_service: Instância do serviço RAG
+
+    Returns:
+        Lista de resultados de busca ordenados por relevância
+    """
+    try:
+        search_query = SearchQuery(
+            query=request.query,
+            user_context=request.user_context,
+            filters=request.filters,
+            limit=request.limit,
+            score_threshold=request.score_threshold
+        )
+
+        results = await rag_service.search_content(search_query)
+        return results
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro na busca: {str(e)}"
+        )
+
+@router.get("/rag/stats", response_model=Dict[str, Any])
+async def get_rag_stats(
+    rag_service: RAGService = Depends(get_rag_service)
+):
+    """
+    Retorna estatísticas da coleção RAG.
+
+    Args:
+        rag_service: Instância do serviço RAG
+
+    Returns:
+        Estatísticas da coleção Qdrant
+    """
+    try:
+        stats = await rag_service.get_collection_stats()
+        return stats
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao obter estatísticas: {str(e)}"
+        )
+
+# --- Endpoints de Agentes Educacionais ---
+
+@router.post("/agent/ask", response_model=AgentResponse)
+async def ask_educational_agent(
+    request: EducationalAgentRequest,
+    agent_service: EducationalAgentService = Depends(get_educational_agent_service)
+):
+    """
+    Processa uma consulta usando agentes educacionais com RAG.
+
+    Args:
+        request: Consulta educacional com contexto do usuário
+        agent_service: Instância do serviço de agentes educacionais
+
+    Returns:
+        Resposta personalizada do agente educacional
+    """
+    try:
+        response = await agent_service.process_educational_query(
+            query=request.query,
+            user_id=request.user_id,
+            user_profile=request.user_profile,
+            session_id=request.session_id
+        )
+
+        return response
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro no processamento do agente: {str(e)}"
+        )
+
+@router.get("/agent/analytics/{user_id}", response_model=Dict[str, Any])
+async def get_student_analytics(
+    user_id: str,
+    agent_service: EducationalAgentService = Depends(get_educational_agent_service)
+):
+    """
+    Retorna analytics educacionais do estudante.
+
+    Args:
+        user_id: ID do usuário
+        agent_service: Instância do serviço de agentes educacionais
+
+    Returns:
+        Estatísticas e métricas do estudante
+    """
+    try:
+        analytics = await agent_service.get_student_analytics(user_id)
+        return analytics
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao obter analytics: {str(e)}"
+        )
+
+@router.post("/agent/profile", response_model=Dict[str, str])
+async def update_student_profile(
+    user_id: str,
+    profile: Dict[str, Any],
+    agent_service: EducationalAgentService = Depends(get_educational_agent_service)
+):
+    """
+    Atualiza o perfil educacional do estudante.
+
+    Args:
+        user_id: ID do usuário
+        profile: Dados do perfil a atualizar
+        agent_service: Instância do serviço de agentes educacionais
+
+    Returns:
+        Confirmação da atualização
+    """
+    try:
+        # Criar ou atualizar perfil
+        student_profile = StudentProfile(
+            user_id=user_id,
+            name=profile.get("name"),
+            learning_style=profile.get("learning_style", "visual"),
+            current_level=profile.get("current_level", "intermediate"),
+            subjects=profile.get("subjects", []),
+            preferred_methodologies=profile.get("preferred_methodologies", []),
+            learning_goals=profile.get("learning_goals", []),
+            past_performance=profile.get("past_performance", {}),
+            learning_pace=profile.get("learning_pace", "moderate"),
+            preferred_difficulty=profile.get("preferred_difficulty", "adaptive"),
+            accessibility_needs=profile.get("accessibility_needs", [])
+        )
+
+        agent_service.student_cache[user_id] = student_profile
+
+        return {"status": "updated", "user_id": user_id}
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao atualizar perfil: {str(e)}"
+        )
+
+# --- Endpoints de Context Engineering e Ferramentas Cognitivas ---
+
+@router.post("/cognitive/analyze", response_model=Dict[str, Any])
+async def analyze_query_cognitively(
+    query: str = Query(..., description="Query a ser analisada"),
+    context: Optional[str] = Query(None, description="Contexto adicional"),
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Analisa uma query usando ferramentas cognitivas.
+
+    Args:
+        query: Query a ser analisada
+        context: Contexto adicional
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Análise cognitiva completa da query
+    """
+    try:
+        analysis = agno_service.analyze_query_cognitively(query, context)
+        return analysis
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro na análise cognitiva: {str(e)}"
+        )
+
+@router.post("/cognitive/validate-solution", response_model=Dict[str, Any])
+async def validate_solution_cognitively(
+    solution: str = Query(..., description="Solução a ser validada"),
+    problem: str = Query(..., description="Problema original"),
+    context: Optional[Dict[str, Any]] = None,
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Valida uma solução usando ferramentas cognitivas.
+
+    Args:
+        solution: Solução proposta
+        problem: Problema original
+        context: Contexto adicional
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Validação completa da solução
+    """
+    try:
+        validation = agno_service.validate_solution_cognitively(
+            solution, problem, context or {}
+        )
+        return validation
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro na validação cognitiva: {str(e)}"
+        )
+
+@router.get("/memory/stats", response_model=Dict[str, Any])
+async def get_memory_stats(
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Retorna estatísticas da memória consolidada.
+
+    Args:
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Estatísticas da memória consolidada
+    """
+    try:
+        stats = agno_service.get_memory_stats()
+        return stats
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao obter estatísticas de memória: {str(e)}"
+        )
+
+@router.get("/memory/state", response_model=Dict[str, Any])
+async def get_memory_state(
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Retorna o estado atual da memória consolidada.
+
+    Args:
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Estado atual da memória consolidada
+    """
+    try:
+        state = agno_service.get_memory_state()
+        return {
+            "learned_concepts": state.learned_concepts,
+            "progress_markers_count": len(state.progress_markers),
+            "methodology_preferences": state.methodology_preferences,
+            "error_patterns_count": len(state.error_patterns),
+            "session_context_length": len(state.session_context),
+            "last_updated": state.last_updated.isoformat() if state.last_updated else None
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao obter estado de memória: {str(e)}"
+        )
+
+@router.post("/memory/consolidate", response_model=Dict[str, Any])
+async def consolidate_memory(
+    interaction_data: Dict[str, Any],
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Consolida uma interação na memória.
+
+    Args:
+        interaction_data: Dados da interação
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Estado da memória após consolidação
+    """
+    try:
+        consolidated_state = agno_service.consolidate_memory(interaction_data)
+        stats = agno_service.get_memory_stats()
+
+        return {
+            "consolidated": True,
+            "stats": stats,
+            "learned_concepts_count": len(consolidated_state.learned_concepts),
+            "last_updated": consolidated_state.last_updated.isoformat() if consolidated_state.last_updated else None
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro na consolidação de memória: {str(e)}"
+        )
+
+# --- Endpoints Específicos para Controle de Metodologia ---
+
+@router.post("/cognitive/suggest", response_model=Dict[str, Any])
+async def get_methodology_suggestion(
+    query: str = Query(..., description="Query para análise cognitiva"),
+    context: Optional[str] = Query(None, description="Contexto adicional"),
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Retorna sugestão de metodologia baseada na análise cognitiva SEM processar a pergunta.
+    Útil para mostrar ao usuário opções antes de escolher.
+
+    Args:
+        query: Query a ser analisada
+        context: Contexto adicional
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Sugestão de metodologia com análise cognitiva
+    """
+    try:
+        suggestion = agno_service.get_cognitive_suggestion(query, context)
+        return suggestion
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao obter sugestão cognitiva: {str(e)}"
+        )
+
+@router.post("/ask/fixed-methodology", response_model=AgnoResponse)
+async def ask_with_fixed_methodology(
+    request: AgnoRequest,
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Processa uma pergunta MANTENDO EXATAMENTE a metodologia escolhida pelo usuário.
+    NÃO permite alteração baseada na análise cognitiva.
+
+    Args:
+        request: Requisição AGNO com metodologia fixa
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Resposta usando exatamente a metodologia escolhida
+    """
+    try:
+        # Valida a metodologia
+        if not _is_valid_methodology(request.methodology):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Metodologia '{request.methodology}' não é válida"
+            )
+
+        methodology_enum = MethodologyType(request.methodology)
+
+        # Processa com metodologia FIXA (sem override cognitivo)
+        response = agno_service.ask_with_fixed_methodology(
+            methodology=methodology_enum,
+            user_query=request.user_query,
+            context=request.context
+        )
+
+        return AgnoResponse(
+            response=response,
+            methodology=request.methodology,
+            is_xml_formatted=False,
+            metadata={
+                "methodology_locked": True,
+                "cognitive_override": False,
+                "processing_mode": "fixed_methodology"
+            }
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Erro de validação: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno do servidor: {str(e)}"
+        )
+
+@router.post("/ask/adaptive", response_model=AgnoResponse)
+async def ask_with_cognitive_adaptation(
+    request: AgnoRequest,
+    agno_service: AgnoMethodologyService = Depends(get_agno_service)
+):
+    """
+    Processa uma pergunta PERMITINDO adaptação cognitiva da metodologia.
+    A análise cognitiva pode alterar a metodologia baseada na complexidade da query.
+
+    Args:
+        request: Requisição AGNO com metodologia inicial
+        agno_service: Instância do serviço AGNO
+
+    Returns:
+        Resposta com possível adaptação da metodologia
+    """
+    try:
+        # Valida a metodologia
+        if not _is_valid_methodology(request.methodology):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Metodologia '{request.methodology}' não é válida"
+            )
+
+        methodology_enum = MethodologyType(request.methodology)
+
+        # Processa com ADAPTAÇÃO COGNITIVA (permite override)
+        response = agno_service.ask_with_cognitive_adaptation(
+            methodology=methodology_enum,
+            user_query=request.user_query,
+            context=request.context
+        )
+
+        return AgnoResponse(
+            response=response,
+            methodology=request.methodology,  # metodologia original (pode ter sido alterada internamente)
+            is_xml_formatted=False,
+            metadata={
+                "methodology_locked": False,
+                "cognitive_override": True,
+                "processing_mode": "cognitive_adaptation",
+                "adaptation_possible": True
+            }
+        )
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Erro de validação: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno do servidor: {str(e)}"
+        )

@@ -37,6 +37,35 @@ services:
         hard: 65536
     stop_grace_period: 10s
 
+  # Qdrant Vector Database (core profile) - Para RAG
+  qdrant:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.qdrant
+    container_name: coderbot-qdrant
+    ports:
+      - "6333:6333"  # HTTP API
+      - "6334:6334"  # gRPC API
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+    networks:
+      - coderbot-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging: *default-logging
+    cpus: "1.00"
+    mem_limit: "1g"
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 65536
+    stop_grace_period: 15s
+
   # Backend API (core profile) - otimizado
   backend:
     build:
@@ -274,6 +303,10 @@ services:
 
 volumes:
   pocketbase_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  qdrant_snapshots:
     driver: local
   # code_server_data:
   #   driver: local
