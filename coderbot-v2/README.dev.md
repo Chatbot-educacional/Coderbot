@@ -216,8 +216,8 @@ sudo lsof -i :8090
 2. **Hot reload não funciona:**
 ```bash
 # Verificar se os volumes estão montados corretamente
-docker-compose -f docker-compose.dev.yml exec frontend ls -la /app
-docker-compose -f docker-compose.dev.yml exec backend ls -la /app
+docker compose -f docker-compose.dev.yml exec frontend ls -la /app
+docker compose -f docker-compose.dev.yml exec backend ls -la /app
 ```
 
 3. **Dependências não instaladas:**
@@ -238,10 +238,10 @@ Para debugar problemas específicos:
 
 ```bash
 # Ver logs detalhados de um serviço específico
-docker-compose -f docker-compose.dev.yml logs -f [service-name]
+docker compose -f docker-compose.dev.yml logs -f [service-name]
 
 # Entrar no container para debug
-docker-compose -f docker-compose.dev.yml exec [service-name] /bin/bash
+docker compose -f docker-compose.dev.yml exec [service-name] /bin/bash
 ```
 
 ## 📋 Checklist de Desenvolvimento

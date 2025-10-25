@@ -48,7 +48,7 @@ pnpm run build
 3) Suba os serviços:
 ```bash
 cd ..
-docker-compose -f docker-compose.optimized.yml up -d --build
+docker compose -f docker-compose.optimized.yml up -d --build
 ```
 
 4) Acesse:
